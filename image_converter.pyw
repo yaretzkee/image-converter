@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
 Image Format Converter - PySide6 GUI
 
-Converts PNG/JPG/JPEG/TIFF/BMP -> PNG/WEBP/AVIF.
+Converts PNG/JPG/JPEG/TIFF/BMP/SVG/AVIF/WEBP -> PNG/WEBP/AVIF/ICO.
 Optional resize with aspect-ratio preservation.
 Follows system light/dark theme automatically.
 
@@ -13,7 +12,8 @@ Two conversion backends:
 Install dependencies:
     pip install PySide6 Pillow pillow-avif-plugin
 
-pillow-avif-plugin is required only if you use the Pillow backend to export AVIF.
+pillow-avif-plugin is required when using the Pillow backend to read or export AVIF.
+SVG is rasterized by the Qt SVG renderer bundled with PySide6 when using the Pillow backend.
 """
 
 import os
@@ -23,7 +23,8 @@ import subprocess
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPalette, QColor
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPalette, QColor, QImage, QPainter
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QListWidget, QCheckBox, QRadioButton, QButtonGroup, QPushButton,
@@ -31,8 +32,10 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSpinBox, QStyleFactory
 )
 
-INPUT_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
-OUTPUT_FORMATS = ["png", "webp", "avif"]
+INPUT_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".svg", ".avif", ".webp"}
+OUTPUT_FORMATS = ["png", "webp", "avif", "ico"]
+SVG_DEFAULT_MAX_DIMENSION = 2048
+APP_VERSION = "1.0.1"
 
 
 try:
@@ -42,8 +45,8 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 try:
-    import pillow_avif  # noqa: F401  registers AVIF plugin with Pillow
-    PILLOW_AVIF_AVAILABLE = True
+    import pillow_avif  # registers AVIF plugin with Pillow
+    PILLOW_AVIF_AVAILABLE = bool(pillow_avif)
 except ImportError:
     PILLOW_AVIF_AVAILABLE = False
 
@@ -181,16 +184,47 @@ class ConversionWorker(QThread):
         # ImageMagick: WxH with no '!' preserves aspect ratio (fits within box)
         return f"{self.resize_w}x{self.resize_h}"
 
+    def _svg_raster_dimensions(self, src: Path) -> tuple[int, int, int, int]:
+        """Return source and target dimensions for a high-quality SVG rasterization."""
+        renderer = QSvgRenderer(str(src))
+        if not renderer.isValid():
+            raise RuntimeError("Unable to read SVG file")
+
+        source_size = renderer.defaultSize()
+        source_width = max(1, source_size.width())
+        source_height = max(1, source_size.height())
+        max_width, max_height = (
+            (self.resize_w, self.resize_h)
+            if self.resize_enabled
+            else (SVG_DEFAULT_MAX_DIMENSION, SVG_DEFAULT_MAX_DIMENSION)
+        )
+        scale = min(max_width / source_width, max_height / source_height)
+        return (
+            source_width,
+            source_height,
+            max(1, round(source_width * scale)),
+            max(1, round(source_height * scale)),
+        )
+
     def _convert_imagemagick(self, src: Path, out_path: Path, fmt: str):
-        base_cmd = ["magick", str(src)]
-        if self.resize_enabled:
+        is_svg = src.suffix.lower() == ".svg"
+        if is_svg:
+            source_width, source_height, target_width, target_height = self._svg_raster_dimensions(src)
+            density = 72 * max(target_width / source_width, target_height / source_height)
+            base_cmd = [
+                "magick", "-background", "none", "-density", str(density), str(src),
+                "-resize", f"{target_width}x{target_height}!",
+            ]
+        else:
+            base_cmd = ["magick", str(src)]
+        if self.resize_enabled and not is_svg:
             base_cmd += ["-resize", self._resize_geometry_arg()]
 
         if fmt == "avif":
             cmd = base_cmd + ["-define", "heic:speed=2", str(out_path)]
         elif fmt == "webp":
             cmd = base_cmd + ["-quality", "50", str(out_path)]
-        else:  # png
+        else:  # PNG or ICO
             cmd = base_cmd + [str(out_path)]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -200,12 +234,25 @@ class ConversionWorker(QThread):
     def _convert_pillow(self, src: Path, out_path: Path, fmt: str):
         if not PILLOW_AVAILABLE:
             raise RuntimeError("Pillow is not installed (pip install Pillow)")
+        if src.suffix.lower() == ".avif" and not PILLOW_AVIF_AVAILABLE:
+            raise RuntimeError("pillow-avif-plugin not installed (pip install pillow-avif-plugin)")
         if fmt == "avif" and not PILLOW_AVIF_AVAILABLE:
             raise RuntimeError("pillow-avif-plugin not installed (pip install pillow-avif-plugin)")
 
-        img = Image.open(src)
+        if src.suffix.lower() == ".svg":
+            renderer = QSvgRenderer(str(src))
+            _, _, width, height = self._svg_raster_dimensions(src)
+            svg_image = QImage(width, height, QImage.Format_RGBA8888)
+            svg_image.fill(Qt.transparent)
+            painter = QPainter(svg_image)
+            renderer.render(painter)
+            painter.end()
+            img = Image.frombytes("RGBA", (width, height), bytes(svg_image.bits()))
+        else:
+            with Image.open(src) as source_img:
+                img = source_img.copy()
 
-        if self.resize_enabled:
+        if self.resize_enabled and src.suffix.lower() != ".svg":
             img.thumbnail((self.resize_w, self.resize_h), Image.LANCZOS)
 
         if fmt == "png":
@@ -214,13 +261,17 @@ class ConversionWorker(QThread):
             img.save(out_path, format="WEBP", quality=50)
         elif fmt == "avif":
             img.save(out_path, format="AVIF")
+        elif fmt == "ico":
+            # ICO images are conventionally no larger than 256 pixels per side.
+            img.thumbnail((256, 256), Image.LANCZOS)
+            img.convert("RGBA").save(out_path, format="ICO")
 
 
 class ImageConverterApp(QWidget):
     __PROGRAM_PATH = Path(__file__).parent
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Image Format Converter")
+        self.setWindowTitle(f"Image Format Converter v{APP_VERSION}")
         self.resize(560, 700)
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.Window)
                 
@@ -264,7 +315,7 @@ class ImageConverterApp(QWidget):
         self.status_label.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(self.status_label)
 
-        layout.addWidget(QLabel("Drag & drop image files here (PNG, JPG, JPEG, TIFF, BMP):"))
+        layout.addWidget(QLabel("Drag & drop image files here (PNG, JPG, JPEG, TIFF, BMP, SVG, AVIF, WEBP):"))
         self.drop_list = DropListWidget()
         self.drop_list.files_dropped.connect(self._add_files)
         self.drop_list.setMinimumHeight(160)
@@ -361,17 +412,19 @@ class ImageConverterApp(QWidget):
                 self.drop_list.addItem(p)
 
     def _browse_files(self):
-        filt = "Images (*.png *.jpg *.jpeg *.tiff *.tif *.bmp)"
+        filt = "Images (*.png *.jpg *.jpeg *.tiff *.tif *.bmp *.svg *.avif *.webp)"
         files, _ = QFileDialog.getOpenFileNames(self, "Select images", "", filt)
         if files:
             self._add_files(files)
 
-    def _toggle_output_folder(self, state):
+    def _toggle_output_folder(self, _state):
+        del _state
         enabled = not self.cb_same_path.isChecked()
         self.folder_edit.setEnabled(enabled)
         self.btn_folder.setEnabled(enabled)
 
-    def _toggle_resize(self, state):
+    def _toggle_resize(self, _state):
+        del _state
         enabled = self.cb_resize.isChecked()
         self.spin_w.setEnabled(enabled)
         self.spin_h.setEnabled(enabled)
